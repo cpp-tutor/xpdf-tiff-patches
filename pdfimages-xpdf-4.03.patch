@@ -1,0 +1,708 @@
+diff -Naur xpdf-4.03.orig/cmake-config.txt xpdf-4.03/cmake-config.txt
+--- xpdf-4.03.orig/cmake-config.txt	2021-01-27 22:23:51.000000000 +0000
++++ xpdf-4.03/cmake-config.txt	2021-11-06 13:17:33.279684760 +0000
+@@ -207,6 +207,8 @@
+ #--- look for libpng
+ find_package(PNG)
+ 
++#--- look for libtiff
++find_package(TIFF)
+ 
+ 
+ 
+diff -Naur xpdf-4.03.orig/CMakeLists.txt xpdf-4.03/CMakeLists.txt
+--- xpdf-4.03.orig/CMakeLists.txt	2021-01-27 22:23:51.000000000 +0000
++++ xpdf-4.03/CMakeLists.txt	2021-11-06 13:18:34.071684760 +0000
+@@ -25,7 +25,11 @@
+ endif ()
+ 
+ if (NOT PNG_FOUND)
+-  message(WARNING "Couldn't find libpng -- will not build pdftopng or pdftohtml.")
++  message(WARNING "Couldn't find libpng -- will not build pdfimages, pdftopng or pdftohtml.")
++endif ()
++
++if (NOT TIFF_FOUND)
++  message(WARNING "Couldn't find libtiff -- will not build pdfimages.")
+ endif ()
+ 
+ if (NOT QT4_FOUND AND NOT Qt5Widgets_FOUND)
+diff -Naur xpdf-4.03.orig/xpdf/CMakeLists.txt xpdf-4.03/xpdf/CMakeLists.txt
+--- xpdf-4.03.orig/xpdf/CMakeLists.txt	2021-01-27 22:23:52.000000000 +0000
++++ xpdf-4.03/xpdf/CMakeLists.txt	2021-11-11 14:43:59.242001000 +0000
+@@ -17,6 +17,10 @@
+   include_directories("${PNG_INCLUDE_DIRS}")
+   add_definitions("${PNG_DEFINITIONS}")
+ endif ()
++if (TIFF_FOUND)
++  include_directories("${TIFF_INCLUDE_DIRS}")
++  add_definitions("${TIFF_DEFINITIONS}")
++endif ()
+ if (HAVE_LCMS)
+   include_directories("${LCMS_INCLUDE_DIR}")
+   set(COLOR_MANAGER_SOURCE "ColorManager.cc")
+@@ -263,6 +267,8 @@
+ target_link_libraries(pdfimages goo fofi
+                       ${PAPER_LIBRARY}
+                       ${LCMS_LIBRARY}
++                      ${TIFF_LIBRARY}
++                      ${PNG_LIBRARIES}
+                       ${FONTCONFIG_LIBRARY}
+                       ${CMAKE_THREAD_LIBS_INIT})
+ install(TARGETS pdfimages RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+diff -Naur xpdf-4.03.orig/xpdf/ImageOutputDev.cc xpdf-4.03/xpdf/ImageOutputDev.cc
+--- xpdf-4.03.orig/xpdf/ImageOutputDev.cc	2021-01-27 22:23:51.000000000 +0000
++++ xpdf-4.03/xpdf/ImageOutputDev.cc	2021-11-11 14:39:42.090001000 +0000
+@@ -17,6 +17,7 @@
+ #include <stddef.h>
+ #include <ctype.h>
+ #include <math.h>
++#include <tiffio.h>
+ #include "gmem.h"
+ #include "gmempp.h"
+ #include "config.h"
+@@ -27,10 +28,13 @@
+ #include "ImageOutputDev.h"
+ 
+ ImageOutputDev::ImageOutputDev(char *fileRootA, GBool dumpJPEGA,
+-			       GBool dumpRawA, GBool listA) {
++			       GBool dumpRawA, GBool dumpPNGA,
++			       GBool dumpTIFFA, GBool listA) {
+   fileRoot = copyString(fileRootA);
+   dumpJPEG = dumpJPEGA;
+   dumpRaw = dumpRawA;
++  dumpPNG = dumpPNGA;
++  dumpTIFF = dumpTIFFA;
+   list = listA;
+   imgNum = 0;
+   curPageNum = 0;
+@@ -60,8 +64,13 @@
+ 				   GBool inlineImg, GBool interpolate) {
+   GString *fileName;
+   FILE *f;
++  double hdpi, vdpi, x0, y0, x1, y1; // used for PNG and TIFF output
++  png_structp png;
++  png_infop pngInfo;
++  TIFF *tiff;
++  Guchar *row;
+   char buf[4096];
+-  int size, n, i;
++  int size, n, i, y;
+ 
+   // dump raw file
+   if (dumpRaw && !inlineImg) {
+@@ -112,6 +121,101 @@
+     str->close();
+     fclose(f);
+ 
++  } else if (dumpPNG) {
++    fileName = GString::format("{0:s}-{1:04d}.png", fileRoot, imgNum);
++    ++imgNum;
++    if (!(f = fopen(fileName->getCString(), "wb"))) {
++      error(errIO, -1, "Couldn't open image file '{0:s}'", fileName);
++      return;
++    }
++    
++    state->transformDelta(1, 0, &x0, &y0);
++    state->transformDelta(0, 1, &x1, &y1);
++    x0 = fabs(x0);
++    y0 = fabs(y0);
++    x1 = fabs(x1);
++    y1 = fabs(y1);
++    if (x0 > y0) {
++      hdpi = (72 * width) / x0;
++      vdpi = (72 * height) / y1;
++    } else {
++      hdpi = (72 * height) / x1;
++      vdpi = (72 * width) / y0;
++    }
++
++    setupPNG(&png, &pngInfo, f,
++      1,
++      PNG_COLOR_TYPE_GRAY,
++      hdpi, vdpi, width, height);
++    // initialize stream
++    str->reset();
++
++    // copy the stream
++    size = (width + 7) / 8;
++    row = (Guchar *)gmalloc(size);
++    for (y = 0; y < height; ++y) {
++      str->getBlock((char*)row, size);
++      if (setjmp(png_jmpbuf(png))) {
++        exit(2);
++      }
++      png_write_row(png, (png_bytep)row);
++    }
++    gfree(row);
++
++    str->close();
++    finishPNG(&png, &pngInfo);
++    fclose(f);
++
++} else if (dumpTIFF) {
++    fileName = GString::format("{0:s}-{1:04d}.tif", fileRoot, imgNum);
++    ++imgNum;
++    if (!(tiff = TIFFOpen(fileName->getCString(), "w")))
++    {
++      error(errIO, -1, "Couldn't open image file '{0:s}'", fileName);
++      return;
++    }
++
++    state->transformDelta(1, 0, &x0, &y0);
++    state->transformDelta(0, 1, &x1, &y1);
++    x0 = fabs(x0);
++    y0 = fabs(y0);
++    x1 = fabs(x1);
++    y1 = fabs(y1);
++    if (x0 > y0) {
++      hdpi = (72 * width) / x0;
++      vdpi = (72 * height) / y1;
++    } else {
++      hdpi = (72 * height) / x1;
++      vdpi = (72 * width) / y0;
++    }
++    TIFFSetField(tiff, TIFFTAG_IMAGEWIDTH, width);
++    TIFFSetField(tiff, TIFFTAG_IMAGELENGTH, height);
++    TIFFSetField(tiff, TIFFTAG_BITSPERSAMPLE, 1);
++    TIFFSetField(tiff, TIFFTAG_SAMPLESPERPIXEL, 1);
++    TIFFSetField(tiff, TIFFTAG_PHOTOMETRIC, PHOTOMETRIC_MINISBLACK);
++    TIFFSetField(tiff, TIFFTAG_ROWSPERSTRIP, 1);
++    TIFFSetField(tiff, TIFFTAG_COMPRESSION, COMPRESSION_CCITTRLE);
++    TIFFSetField(tiff, TIFFTAG_FILLORDER, FILLORDER_MSB2LSB);
++    TIFFSetField(tiff, TIFFTAG_PLANARCONFIG, PLANARCONFIG_CONTIG);
++    TIFFSetField(tiff, TIFFTAG_XRESOLUTION, hdpi);
++    TIFFSetField(tiff, TIFFTAG_YRESOLUTION, vdpi);
++    TIFFSetField(tiff, TIFFTAG_RESOLUTIONUNIT, RESUNIT_INCH);
++
++    // initialize stream
++    str->reset();
++
++    // copy the stream
++    size = (width + 7) / 8;
++    row = (Guchar *)gmalloc(size);
++    for (y = 0; y < height; ++y) {
++      str->getBlock((char*)row, size);
++      TIFFWriteEncodedStrip(tiff, y, row, size);
++    }
++    gfree(row);
++
++    str->close();
++    TIFFClose(tiff);
++
+   // dump PBM file
+   } else {
+ 
+@@ -161,9 +265,21 @@
+   GString *fileName;
+   FILE *f;
+   ImageStream *imgStr;
+-  Guchar *p;
++  double hdpi, vdpi, x0, y0, x1, y1; // used for PNG and TIFF output
++  GBool monoImage = gFalse;
++  GBool grayImage = gFalse;
++#if SPLASH_CMYK
++  GBool cmykImage = gFalse;
++#endif // SPLASH_CMYK
++  png_structp png;
++  png_infop pngInfo;
++  TIFF *tiff;
++  Guchar *p, *row, *rowp;
+   GfxRGB rgb;
+   GfxGray gray;
++#if SPLASH_CMYK
++  GfxCMYK cmyk;
++#endif // SPLASH_CMYK
+   int x, y;
+   char buf[4096];
+   int size, n, i, j;
+@@ -226,6 +342,293 @@
+     str->close();
+     fclose(f);
+ 
++  } else if (dumpPNG) {
++    fileName = GString::format("{0:s}-{1:04d}.png", fileRoot, imgNum);
++    ++imgNum;
++    if (!(f = fopen(fileName->getCString(), "wb"))) {
++      error(errIO, -1, "Couldn't open image file '{0:s}'", fileName);
++      return;
++    }
++    
++    monoImage = colorMap->getNumPixelComps() == 1 && colorMap->getBits() == 1;
++    grayImage = colorMap->getNumPixelComps() == 1 && (csMode == csDeviceGray || csMode == csCalGray);
++
++    state->transformDelta(1, 0, &x0, &y0);
++    state->transformDelta(0, 1, &x1, &y1);
++    x0 = fabs(x0);
++    y0 = fabs(y0);
++    x1 = fabs(x1);
++    y1 = fabs(y1);
++    if (x0 > y0) {
++      hdpi = (72 * width) / x0;
++      vdpi = (72 * height) / y1;
++    } else {
++      hdpi = (72 * height) / x1;
++      vdpi = (72 * width) / y0;
++    }
++
++    if (monoImage) {
++      setupPNG(&png, &pngInfo, f,
++        1,
++        PNG_COLOR_TYPE_GRAY,
++        hdpi, vdpi, width, height);
++      // initialize stream
++      str->reset();
++
++      // copy the stream
++      size = (width + 7) / 8;
++      row = (Guchar *)gmalloc(size);
++      for (y = 0; y < height; ++y) {
++        str->getBlock((char*)row, size);
++        if (setjmp(png_jmpbuf(png))) {
++          exit(2);
++        }
++        png_write_row(png, (png_bytep)row);
++      }
++      gfree(row);
++
++      str->close();
++    } else if (grayImage) {
++      setupPNG(&png, &pngInfo, f,
++        8,
++        PNG_COLOR_TYPE_GRAY,
++        hdpi, vdpi, width, height);
++      imgStr = new ImageStream(str, width, colorMap->getNumPixelComps(),
++			     colorMap->getBits());
++      imgStr->reset();
++
++      // for each line...
++      row = (Guchar *)gmallocn(width, 1);
++      for (y = 0; y < height; ++y) {
++
++        // write the line
++        rowp = row;
++        if ((p = imgStr->getLine())) {
++        
++	  for (x = 0; x < width; ++x) {
++	    colorMap->getGray(p, &gray, state->getRenderingIntent());
++	    *rowp++ = colToByte(gray);
++	    ++p;
++	  }
++        } else {
++	  for (x = 0; x < width; ++x) {
++	    *rowp++ = 0;
++	  }
++        }
++        if (setjmp(png_jmpbuf(png))) {
++          exit(2);
++        }
++        png_write_row(png, (png_bytep)row);
++      }
++      gfree(row);
++
++      imgStr->close();
++      delete imgStr;
++    } else { // convert everything else to RGB
++      setupPNG(&png, &pngInfo, f,
++        8,
++        PNG_COLOR_TYPE_RGB,
++        hdpi, vdpi, width, height);
++
++      imgStr = new ImageStream(str, width, colorMap->getNumPixelComps(),
++			     colorMap->getBits());
++      imgStr->reset();
++
++      // for each line...
++      row = (Guchar *)gmallocn(width, 3);
++      for (y = 0; y < height; ++y) {
++
++        // write the line
++        rowp = row;
++        if ((p = imgStr->getLine())) {
++        
++	  for (x = 0; x < width; ++x) {
++	    colorMap->getRGB(p, &rgb, state->getRenderingIntent());
++	    *rowp++ = colToByte(rgb.r);
++	    *rowp++ = colToByte(rgb.g);
++	    *rowp++ = colToByte(rgb.b);
++	    p += colorMap->getNumPixelComps();
++	  }
++        } else {
++	  for (x = 0; x < width; ++x) {
++	    *rowp++ = 0;
++	    *rowp++ = 0;
++	    *rowp++ = 0;
++	  }
++        }
++        if (setjmp(png_jmpbuf(png))) {
++          exit(2);
++        }
++        png_write_row(png, (png_bytep)row);
++      }
++      gfree(row);
++
++      imgStr->close();
++      delete imgStr;
++    }
++
++    finishPNG(&png, &pngInfo);
++    fclose(f);
++
++  } else if (dumpTIFF) {
++    fileName = GString::format("{0:s}-{1:04d}.tif", fileRoot, imgNum);
++    ++imgNum;
++    if (!(tiff = TIFFOpen(fileName->getCString(), "w")))
++    {
++      error(errIO, -1, "Couldn't open image file '{0:s}'", fileName);
++      return;
++    }
++
++    monoImage = colorMap->getNumPixelComps() == 1 && colorMap->getBits() == 1;
++    grayImage = colorMap->getNumPixelComps() == 1 && (csMode == csDeviceGray || csMode == csCalGray);
++    cmykImage = colorMap->getNumPixelComps() == 4 && csMode == csDeviceCMYK;
++
++    state->transformDelta(1, 0, &x0, &y0);
++    state->transformDelta(0, 1, &x1, &y1);
++    x0 = fabs(x0);
++    y0 = fabs(y0);
++    x1 = fabs(x1);
++    y1 = fabs(y1);
++    if (x0 > y0) {
++      hdpi = (72 * width) / x0;
++      vdpi = (72 * height) / y1;
++    } else {
++      hdpi = (72 * height) / x1;
++      vdpi = (72 * width) / y0;
++    }
++    TIFFSetField(tiff, TIFFTAG_IMAGEWIDTH, width);
++    TIFFSetField(tiff, TIFFTAG_IMAGELENGTH, height);
++    TIFFSetField(tiff, TIFFTAG_BITSPERSAMPLE, monoImage ? 1 : 8);
++    TIFFSetField(tiff, TIFFTAG_SAMPLESPERPIXEL, monoImage || grayImage ? 1 :
++#if SPLASH_CMYK
++							cmykImage ? 4 : 3);
++#else
++							3);
++#endif // SPLASH_CMYK
++    TIFFSetField(tiff, TIFFTAG_PHOTOMETRIC, monoImage || grayImage ? PHOTOMETRIC_MINISBLACK :
++#if SPLASH_CMYK
++						cmykImage ? PHOTOMETRIC_SEPARATED : PHOTOMETRIC_RGB);
++#else
++						PHOTOMETRIC_RGB);
++#endif // SPLASH_CMYK
++    TIFFSetField(tiff, TIFFTAG_ROWSPERSTRIP, 1);
++    TIFFSetField(tiff, TIFFTAG_COMPRESSION, monoImage ? COMPRESSION_CCITTRLE : COMPRESSION_LZW);
++    TIFFSetField(tiff, TIFFTAG_FILLORDER, FILLORDER_MSB2LSB);
++    TIFFSetField(tiff, TIFFTAG_PLANARCONFIG, PLANARCONFIG_CONTIG);
++    TIFFSetField(tiff, TIFFTAG_XRESOLUTION, hdpi);
++    TIFFSetField(tiff, TIFFTAG_YRESOLUTION, vdpi);
++    TIFFSetField(tiff, TIFFTAG_RESOLUTIONUNIT, RESUNIT_INCH);
++
++    if (monoImage) {
++      // initialize stream
++      str->reset();
++
++      // copy the stream
++      size = (width + 7) / 8;
++      row = (Guchar *)gmalloc(size);
++      for (y = 0; y < height; ++y) {
++        str->getBlock((char*)row, size);
++        TIFFWriteEncodedStrip(tiff, y, row, size);
++      }
++      gfree(row);
++
++      str->close();
++
++    } else if (grayImage) {
++      imgStr = new ImageStream(str, width, colorMap->getNumPixelComps(),
++			     colorMap->getBits());
++      imgStr->reset();
++      row = (Guchar *)gmallocn(width, 1);
++      for (y = 0; y < height; ++y) {
++
++        rowp = row;
++        if ((p = imgStr->getLine())) {
++        
++	  for (x = 0; x < width; ++x) {
++	    colorMap->getGray(p, &gray, state->getRenderingIntent());
++	    *rowp++ = colToByte(gray);
++	    ++p;
++         }
++        } else {
++	  for (x = 0; x < width; ++x) {
++	    *rowp++ = 0;
++	  }
++        }
++        TIFFWriteEncodedStrip(tiff, y, row, width);
++      }
++      gfree(row);
++
++      imgStr->close();
++      delete imgStr;
++
++#if SPLASH_CMYK
++    } else if (cmykImage) {
++      imgStr = new ImageStream(str, width, colorMap->getNumPixelComps(),
++			     colorMap->getBits());
++      imgStr->reset();
++      row = (Guchar *)gmallocn(width, colorMap->getNumPixelComps());
++      for (y = 0; y < height; ++y) {
++
++        rowp = row;
++        if ((p = imgStr->getLine())) {
++
++	  for (x = 0; x < width; ++x) {
++	    colorMap->getCMYK(p, &cmyk, state->getRenderingIntent());
++	    *rowp++ = colToByte(cmyk.c);
++	    *rowp++ = colToByte(cmyk.m);
++	    *rowp++ = colToByte(cmyk.y);
++	    *rowp++ = colToByte(cmyk.k);
++	    p += colorMap->getNumPixelComps();
++         }
++        } else {
++	  for (x = 0; x < width; ++x) {
++	    *rowp++ = 0;
++	    *rowp++ = 0;
++	    *rowp++ = 0;
++	    *rowp++ = 0;
++	  }
++        }
++        TIFFWriteEncodedStrip(tiff, y, row, width * colorMap->getNumPixelComps());
++      }
++      gfree(row);
++
++      imgStr->close();
++      delete imgStr;
++#endif // SPLASH_CMYK
++    } else { // convert everything else to RGB
++      imgStr = new ImageStream(str, width, colorMap->getNumPixelComps(),
++			     colorMap->getBits());
++      imgStr->reset();
++      row = (Guchar *)gmallocn(width, 3);
++      for (y = 0; y < height; ++y) {
++
++        rowp = row;
++        if ((p = imgStr->getLine())) {
++        
++	  for (x = 0; x < width; ++x) {
++	    colorMap->getRGB(p, &rgb, state->getRenderingIntent());
++	    *rowp++ = colToByte(rgb.r);
++	    *rowp++ = colToByte(rgb.g);
++	    *rowp++ = colToByte(rgb.b);
++	    p += colorMap->getNumPixelComps();
++         }
++        } else {
++	  for (x = 0; x < width; ++x) {
++	    *rowp++ = 0;
++	    *rowp++ = 0;
++	    *rowp++ = 0;
++	  }
++        }
++        TIFFWriteEncodedStrip(tiff, y, row, width * 3);
++      }
++      gfree(row);
++
++      imgStr->close();
++      delete imgStr;
++    }
++
++    TIFFClose(tiff);
++
+   // dump PBM file
+   } else if (colorMap->getNumPixelComps() == 1 &&
+ 	     colorMap->getBits() == 1) {
+@@ -305,6 +708,54 @@
+ 
+     fclose(f);
+ 
++#if SPLASH_CMYK
++  // dump PAM file
++  } else if (cmykImage) {
++
++    // open the image file and write the PAM header
++    fileName = GString::format("{0:s}-{1:04d}.pam", fileRoot, imgNum);
++    ++imgNum;
++    if (!(f = openFile(fileName->getCString(), "wb"))) {
++      error(errIO, -1, "Couldn't open image file '{0:t}'", fileName);
++      delete fileName;
++      return;
++    }
++    fprintf(f, "P7\n");
++    fprintf(f, "WIDTH %d\n", width);
++    fprintf(f, "HEIGHT %d\n", height);
++    fprintf(f, "DEPTH 4\n");
++    fprintf(f, "MAXVAL 255\n");
++    fprintf(f, "TUPLTYPE CMYK\n");
++    fprintf(f, "ENDHDR\n");
++    imgStr = new ImageStream(str, width, colorMap->getNumPixelComps(),
++			     colorMap->getBits());
++    imgStr->reset();
++    for (y = 0; y < height; ++y) {
++
++      if ((p = imgStr->getLine())) {
++
++        for (x = 0; x < width; ++x) {
++          colorMap->getCMYK(p, &cmyk, state->getRenderingIntent());
++          fputc(colToByte(cmyk.c), f);
++          fputc(colToByte(cmyk.m), f);
++          fputc(colToByte(cmyk.y), f);
++          fputc(colToByte(cmyk.k), f);
++          p += colorMap->getNumPixelComps();
++        }
++      } else {
++	for (x = 0; x < width; ++x) {
++	  fputc(0, f);
++	  fputc(0, f);
++	  fputc(0, f);
++          fputc(0, f);
++        }
++      }
++    }
++
++    imgStr->close();
++    delete imgStr;
++#endif // SPLASH_CMYK
++
+   // dump PPM file
+   } else {
+ 
+@@ -451,3 +902,46 @@
+ 	 mode ? mode : "",
+ 	 bpc);
+ }
++
++void ImageOutputDev::setupPNG(png_structp *png, png_infop *pngInfo, FILE *f,
++		     int bitDepth, int colorType,
++		     double xres, double yres,
++		     int imgWidth, int imgHeight) {
++  png_color_16 background;
++  int xPixelsPerMeter, yPixelsPerMeter;
++
++  if (!(*png = png_create_write_struct(PNG_LIBPNG_VER_STRING,
++				       NULL, NULL, NULL)) ||
++      !(*pngInfo = png_create_info_struct(*png))) {
++    exit(2);
++  }
++  if (setjmp(png_jmpbuf(*png))) {
++    exit(2);
++  }
++  png_init_io(*png, f);
++  png_set_IHDR(*png, *pngInfo, imgWidth, imgHeight,
++	       bitDepth, colorType, PNG_INTERLACE_NONE,
++	       PNG_COMPRESSION_TYPE_DEFAULT, PNG_FILTER_TYPE_DEFAULT);
++  if (colorType == PNG_COLOR_TYPE_GRAY_ALPHA ||
++      colorType == PNG_COLOR_TYPE_RGB_ALPHA) {
++    background.index = 0;
++    background.red = 0xff;
++    background.green = 0xff;
++    background.blue = 0xff;
++    background.gray = 0xff;
++    png_set_bKGD(*png, *pngInfo, &background);
++  }
++  xPixelsPerMeter = (int)(xres * (1000 / 25.4) + 0.5);
++  yPixelsPerMeter = (int)(yres * (1000 / 25.4) + 0.5);
++  png_set_pHYs(*png, *pngInfo, xPixelsPerMeter, yPixelsPerMeter,
++	       PNG_RESOLUTION_METER);
++  png_write_info(*png, *pngInfo);
++}
++
++void ImageOutputDev::finishPNG(png_structp *png, png_infop *pngInfo) {
++  if (setjmp(png_jmpbuf(*png))) {
++    exit(2);
++  }
++  png_write_end(*png, *pngInfo);
++  png_destroy_write_struct(png, pngInfo);
++}
+diff -Naur xpdf-4.03.orig/xpdf/ImageOutputDev.h xpdf-4.03/xpdf/ImageOutputDev.h
+--- xpdf-4.03.orig/xpdf/ImageOutputDev.h	2021-01-27 22:23:51.000000000 +0000
++++ xpdf-4.03/xpdf/ImageOutputDev.h	2021-11-06 13:38:32.183684760 +0000
+@@ -16,6 +16,7 @@
+ #endif
+ 
+ #include <stdio.h>
++#include <png.h>
+ #include "gtypes.h"
+ #include "OutputDev.h"
+ 
+@@ -35,8 +36,9 @@
+   // are written as JPEG (.jpg) files.  If <dumpRaw> is set, all
+   // images are written in PDF-native formats.  If <list> is set, a
+   // one-line summary will be written to stdout for each image.
++  // Only ONE of dumpRaw, dumpPNG, dumpTIFF should be set.
+   ImageOutputDev(char *fileRootA, GBool dumpJPEGA, GBool dumpRawA,
+-		 GBool listA);
++		 GBool dumpPNGA, GBool dumpTIFFA, GBool listA);
+ 
+   // Destructor.
+   virtual ~ImageOutputDev();
+@@ -103,10 +105,18 @@
+   void writeImageInfo(GString *fileName,
+ 		      int width, int height, GfxState *state,
+ 		      GfxImageColorMap *colorMap);
++  // the following two functions are copied from pdftopng.cc
++  static void setupPNG(png_structp *png, png_infop *pngInfo, FILE *f,
++		      int bitDepth, int colorType,
++		      double imgXRes, double imgYRes,
++		      int imgWidth, int imgHeight);
++  static void finishPNG(png_structp *png, png_infop *pngInfo);
+ 
+   char *fileRoot;		// root of output file names
+   GBool dumpJPEG;		// set to dump native JPEG files
+   GBool dumpRaw;		// set to dump raw PDF-native image files
++  GBool dumpPNG;		// set to dump native PNG files
++  GBool dumpTIFF;		// set to dump native TIFF files
+   GBool list;			// set to write image info to stdout
+   int imgNum;			// current image number
+   int curPageNum;		// current page number
+diff -Naur xpdf-4.03.orig/xpdf/pdfimages.cc xpdf-4.03/xpdf/pdfimages.cc
+--- xpdf-4.03.orig/xpdf/pdfimages.cc	2021-01-27 22:23:52.000000000 +0000
++++ xpdf-4.03/xpdf/pdfimages.cc	2021-11-06 13:27:46.299684760 +0000
+@@ -32,6 +32,8 @@
+ static int lastPage = 0;
+ static GBool dumpJPEG = gFalse;
+ static GBool dumpRaw = gFalse;
++static GBool dumpPNG = gFalse;
++static GBool dumpTIFF = gFalse;
+ static GBool list = gFalse;
+ static char ownerPassword[33] = "\001";
+ static char userPassword[33] = "\001";
+@@ -49,6 +51,10 @@
+    "write JPEG images as JPEG files"},
+   {"-raw",    argFlag,     &dumpRaw,       0,
+    "write raw data in PDF-native formats"},
++  {"-png",    argFlag,     &dumpPNG,       0,
++   "write images as PNG files (can combine with -j)"},
++  {"-tiff",   argFlag,     &dumpTIFF,      0,
++   "write images as TIFF files (can combine with -j)"},
+   {"-list",   argFlag,     &list,          0,
+    "write information to stdout for each image"},
+   {"-opw",    argString,   ownerPassword,  sizeof(ownerPassword),
+@@ -79,13 +85,20 @@
+   GString *ownerPW, *userPW;
+   ImageOutputDev *imgOut;
+   GBool ok;
+-  int exitCode;
++  int exitCode, n;
+ 
+   exitCode = 99;
+ 
+   // parse args
+   fixCommandLine(&argc, &argv);
+   ok = parseArgs(argDesc, &argc, argv);
++  n = 0;
++  n += dumpRaw ? 1 : 0;
++  n += dumpPNG ? 1 : 0;
++  n += dumpTIFF ? 1 : 0;
++  if (n > 1) {
++    ok = gFalse;
++  }
+   if (!ok || argc != 3 || printVersion || printHelp) {
+     fprintf(stderr, "pdfimages version %s [www.xpdfreader.com]\n", xpdfVersion);
+     fprintf(stderr, "%s\n", xpdfCopyright);
+@@ -141,7 +154,7 @@
+     lastPage = doc->getNumPages();
+ 
+   // write image files
+-  imgOut = new ImageOutputDev(imgRoot, dumpJPEG, dumpRaw, list);
++  imgOut = new ImageOutputDev(imgRoot, dumpJPEG, dumpRaw, dumpPNG, dumpTIFF, list);
+   if (imgOut->isOk()) {
+     doc->displayPages(imgOut, firstPage, lastPage, 72, 72, 0,
+ 		      gFalse, gTrue, gFalse);
