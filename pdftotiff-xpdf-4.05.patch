@@ -1,0 +1,485 @@
+diff -Naur xpdf-4.05.orig/CMakeLists.txt xpdf-4.05/CMakeLists.txt
+--- xpdf-4.05.orig/CMakeLists.txt	2024-02-07 20:32:40.000000000 +0000
++++ xpdf-4.05/CMakeLists.txt	2024-02-16 13:19:22.572890700 +0000
+@@ -32,6 +32,10 @@
+   message(WARNING "Couldn't find Qt4/5/6 -- will not build xpdf.")
+ endif ()
+ 
++if (NOT TIFF_FOUND)
++  message(WARNING "Couldn't find libtiff -- will not build pdftotiff.")
++endif ()
++
+ if (NOT MULTITHREADED)
+   message(WARNING "Multithreading is disabled -- will not build xpdf.")
+ endif ()
+diff -Naur xpdf-4.05.orig/cmake-config.txt xpdf-4.05/cmake-config.txt
+--- xpdf-4.05.orig/cmake-config.txt	2024-02-07 20:32:40.000000000 +0000
++++ xpdf-4.05/cmake-config.txt	2024-02-16 13:19:22.376515800 +0000
+@@ -194,7 +194,8 @@
+ #--- look for libpng
+ find_package(PNG)
+ 
+-
++#--- look for libtiff
++find_package(TIFF)
+ 
+ 
+ #--- look for Qt
+diff -Naur xpdf-4.05.orig/xpdf/CMakeLists.txt xpdf-4.05/xpdf/CMakeLists.txt
+--- xpdf-4.05.orig/xpdf/CMakeLists.txt	2024-02-07 20:32:41.000000000 +0000
++++ xpdf-4.05/xpdf/CMakeLists.txt	2024-02-16 13:19:23.112846100 +0000
+@@ -17,6 +17,10 @@
+   include_directories("${PNG_INCLUDE_DIRS}")
+   add_definitions("${PNG_DEFINITIONS}")
+ endif ()
++if (TIFF_FOUND)
++  include_directories("${TIFF_INCLUDE_DIRS}")
++  add_definitions("${TIFF_DEFINITIONS}")
++endif ()
+ if (HAVE_LCMS)
+   include_directories("${LCMS_INCLUDE_DIR}")
+   set(COLOR_MANAGER_SOURCE "ColorManager.cc")
+@@ -287,6 +291,27 @@
+ install(TARGETS pdfimages RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+ install(FILES ${PROJECT_SOURCE_DIR}/doc/pdfimages.1 DESTINATION ${CMAKE_INSTALL_MANDIR}/man1)
+ 
++#--- pdftotiff
++
++if (HAVE_SPLASH AND TIFF_FOUND)
++  add_executable(pdftotiff
++    $<TARGET_OBJECTS:xpdf_objs>
++    SplashOutputDev.cc
++    ShadingImage.cc
++    pdftotiff.cc
++  )
++  target_link_libraries(pdftotiff goo fofi splash
++                        ${PAPER_LIBRARY}
++                        ${FREETYPE_LIBRARY} ${FREETYPE_OTHER_LIBS}
++                        ${DTYPE_LIBRARY}
++                        ${LCMS_LIBRARY}
++                        ${TIFF_LIBRARY}
++                        ${FONTCONFIG_LIBRARY}
++                        ${CMAKE_THREAD_LIBS_INIT})
++  install(TARGETS pdftotiff RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
++#  install(FILES ${PROJECT_SOURCE_DIR}/doc/pdftoppm.1 DESTINATION ${CMAKE_INSTALL_MANDIR}/man1)
++endif ()
++
+ #--- xpdfrc man page
+ 
+ install(FILES ${PROJECT_SOURCE_DIR}/doc/xpdfrc.5 DESTINATION ${CMAKE_INSTALL_MANDIR}/man5)
+diff -Naur xpdf-4.05.orig/xpdf/pdftoppm.cc xpdf-4.05/xpdf/pdftoppm.cc
+--- xpdf-4.05.orig/xpdf/pdftoppm.cc	2024-02-07 20:32:41.000000000 +0000
++++ xpdf-4.05/xpdf/pdftoppm.cc	2024-02-16 13:19:23.690975300 +0000
+@@ -37,6 +37,7 @@
+ #if SPLASH_CMYK
+ static GBool cmyk = gFalse;
+ #endif
++static GBool pgmAlpha = gFalse;
+ static int rotate = 0;
+ static char enableFreeTypeStr[16] = "";
+ static char antialiasStr[16] = "";
+@@ -60,6 +61,8 @@
+    "generate a monochrome PBM file"},
+   {"-gray",   argFlag,     &gray,          0,
+    "generate a grayscale PGM file"},
++  {"-alpha",  argFlag,     &pgmAlpha,      0,
++   "generate a PGM file of the alpha channel (only)"},
+ #if SPLASH_CMYK
+   {"-cmyk",   argFlag,     &cmyk,          0,
+    "generate a CMYK PAM file"},
+@@ -137,6 +140,7 @@
+   n = 0;
+   n += mono ? 1 : 0;
+   n += gray ? 1 : 0;
++  n += pgmAlpha ? 1 : 0;
+ #if SPLASH_CMYK
+   n += cmyk ? 1 : 0;
+ #endif
+@@ -215,7 +219,7 @@
+   // file name extension
+   if (mono) {
+     ext = "pbm";
+-  } else if (gray) {
++  } else if (gray || pgmAlpha) {
+     ext = "pgm";
+ #if SPLASH_CMYK
+   } else if (cmyk) {
+@@ -225,18 +229,25 @@
+     ext = "ppm";
+   }
+ 
+-
+   // check for stdout; set up to print per-page status info
+   toStdout = !strcmp(ppmRoot, "-");
+   printStatusInfo = !toStdout && globalParams->getPrintStatusInfo();
+ 
++  if (toStdout && pgmAlpha) {
++    fprintf(stderr, "Bad output filename: \'-\' (cannot write alpha channel to a pipe)\n");
++    goto err0;
++  }
++
+   // write PPM files
+   if (mono) {
+     paperColor[0] = 0xff;
+     splashOut = new SplashOutputDev(splashModeMono1, 1, gFalse, paperColor);
+-  } else if (gray) {
+-    paperColor[0] = 0xff;
+-    splashOut = new SplashOutputDev(splashModeMono8, 1, gFalse, paperColor);
++  } else if (gray || pgmAlpha) {
++     paperColor[0] = 0xff;
++     splashOut = new SplashOutputDev(splashModeMono8, 1, gFalse, paperColor);
++    if (pgmAlpha) {
++      splashOut->setNoComposite(gTrue);
++    }
+ #if SPLASH_CMYK
+   } else if (cmyk) {
+     paperColor[0] = paperColor[1] = paperColor[2] = paperColor[3] = 0;
+@@ -261,9 +272,15 @@
+ #endif
+       splashOut->getBitmap()->writePNMFile(stdout);
+     } else {
+-      ppmFile = GString::format("{0:s}-{1:06d}.{2:s}", ppmRoot, pg, ext);
+-      splashOut->getBitmap()->writePNMFile(ppmFile->getCString());
+-      delete ppmFile;
++      if (pgmAlpha) {
++        ppmFile = GString::format("{0:s}-{1:06d}.{2:s}", ppmRoot, pg, ext);
++        splashOut->getBitmap()->writeAlphaPGMFile(ppmFile->getCString());
++        delete ppmFile;
++      } else {
++        ppmFile = GString::format("{0:s}-{1:06d}.{2:s}", ppmRoot, pg, ext);
++        splashOut->getBitmap()->writePNMFile(ppmFile->getCString());
++        delete ppmFile;
++      }
+     }
+   }
+   delete splashOut;
+diff -Naur xpdf-4.05.orig/xpdf/pdftotiff.cc xpdf-4.05/xpdf/pdftotiff.cc
+--- xpdf-4.05.orig/xpdf/pdftotiff.cc	1970-01-01 01:00:00.000000000 +0100
++++ xpdf-4.05/xpdf/pdftotiff.cc	2024-02-16 13:19:24.303490700 +0000
+@@ -0,0 +1,326 @@
++//========================================================================
++//
++// pdftotiff.cc (c) Richard Spencer 2020-2022 - License GPLv2/v3
++//
++// Adapted from pdftoppm.cc - Copyright 2003 Glyph & Cog, LLC
++//              pdftopng.cc - Copyright 2009 Glyph & Cog, LLC
++//
++//========================================================================
++
++#include <aconf.h>
++#include <stdio.h>
++#include <tiffio.h>
++#ifdef _WIN32
++#  include <io.h>
++#  include <fcntl.h>
++#endif
++#ifdef DEBUG_FP_LINUX
++#  include <fenv.h>
++#  include <fpu_control.h>
++#endif
++#include "gmem.h"
++#include "gmempp.h"
++#include "parseargs.h"
++#include "GString.h"
++#include "GlobalParams.h"
++#include "Object.h"
++#include "PDFDoc.h"
++#include "SplashBitmap.h"
++#include "Splash.h"
++#include "SplashOutputDev.h"
++#include "config.h"
++
++static int firstPage = 1;
++static int lastPage = 0;
++static double resolution = 150;
++static GBool mono = gFalse;
++static GBool gray = gFalse;
++#if SPLASH_CMYK
++static GBool cmyk = gFalse;
++#endif
++static GBool nocompress = gFalse;
++static GBool tifAlpha = gFalse;
++static char enableFreeTypeStr[16] = "";
++static char antialiasStr[16] = "";
++static char vectorAntialiasStr[16] = "";
++static char ownerPassword[33] = "";
++static char userPassword[33] = "";
++static GBool quiet = gFalse;
++static char cfgFileName[256] = "";
++static GBool printVersion = gFalse;
++static GBool printHelp = gFalse;
++
++static ArgDesc argDesc[] = {
++  {"-f",      argInt,      &firstPage,     0,
++   "first page to print (default is first page of document)"},
++  {"-l",      argInt,      &lastPage,      0,
++   "last page to print (default is last page of document)"},
++  {"-r",      argFP,       &resolution,    0,
++   "resolution, in DPI (default is 150)"},
++  {"-mono",   argFlag,     &mono,          0,
++   "generate a monochrome TIFF file"},
++  {"-gray",   argFlag,     &gray,          0,
++   "generate a grayscale TIFF file"},
++#if SPLASH_CMYK
++  {"-cmyk",   argFlag,     &cmyk,          0,
++   "generate a CMYK TIFF file (default is RGB)"},
++#endif
++  {"-no-compression", argFlag, &nocompress, 0,
++   "disable TIFF compression (default is LZW, CCITT for -mono)"},
++  {"-alpha",  argFlag,     &tifAlpha,      0,
++   "include an alpha channel in the TIFF file (default is no alpha channel)"},
++#if HAVE_FREETYPE_H
++  {"-freetype",   argString,      enableFreeTypeStr, sizeof(enableFreeTypeStr),
++   "enable FreeType font rasterizer: yes, no"},
++#endif
++  {"-aa",         argString,      antialiasStr,   sizeof(antialiasStr),
++   "enable font anti-aliasing: yes, no"},
++  {"-aaVector",   argString,      vectorAntialiasStr, sizeof(vectorAntialiasStr),
++   "enable vector anti-aliasing: yes, no"},
++  {"-opw",    argString,   ownerPassword,  sizeof(ownerPassword),
++   "owner password (for encrypted files, default is none)"},
++  {"-upw",    argString,   userPassword,   sizeof(userPassword),
++   "user password (for encrypted files, default is none)"},
++  {"-q",      argFlag,     &quiet,         0,
++   "don't print any messages or errors"},
++  {"-cfg",        argString,      cfgFileName,    sizeof(cfgFileName),
++   "configuration file to use in place of .xpdfrc"},
++  {"-v",      argFlag,     &printVersion,  0,
++   "print copyright and version info"},
++  {"-h",      argFlag,     &printHelp,     0,
++   "print usage information"},
++  {"-help",   argFlag,     &printHelp,     0,
++   "print usage information"},
++  {"--help",  argFlag,     &printHelp,     0,
++   "print usage information"},
++  {"-?",      argFlag,     &printHelp,     0,
++   "print usage information"},
++  {NULL}
++};
++
++int main(int argc, char *argv[]) {
++  PDFDoc *doc;
++  TIFF *image;
++  char *fileName;
++  char *tifRoot;
++  GString *tifFile;
++  GString *ownerPW, *userPW;
++  SplashColor paperColor;
++  SplashOutputDev *splashOut;
++  GBool ok;
++  int exitCode;
++  int pg, n;
++  const char *ext;
++
++#ifdef DEBUG_FP_LINUX
++  // enable exceptions on floating point div-by-zero
++  feenableexcept(FE_DIVBYZERO);
++  // force 64-bit rounding: this avoids changes in output when minor
++  // code changes result in spills of x87 registers; it also avoids
++  // differences in output with valgrind's 64-bit floating point
++  // emulation (yes, this is a kludge; but it's pretty much
++  // unavoidable given the x87 instruction set; see gcc bug 323 for
++  // more info)
++  fpu_control_t cw;
++  _FPU_GETCW(cw);
++  cw = (fpu_control_t)((cw & ~_FPU_EXTENDED) | _FPU_DOUBLE);
++  _FPU_SETCW(cw);
++#endif
++
++  exitCode = 99;
++
++  // parse args
++  fixCommandLine(&argc, &argv);
++  ok = parseArgs(argDesc, &argc, argv);
++  n = 0;
++  n += mono ? 1 : 0;
++  n += gray ? 1 : 0;
++#if SPLASH_CMYK
++  n += cmyk ? 1 : 0;
++#endif
++  if (n > 1) {
++    ok = gFalse;
++  }
++  if (!ok || argc != 3 || printVersion || printHelp) {
++    fprintf(stderr, "pdftotiff version %s\n", xpdfVersion);
++    fprintf(stderr, "%s\n", xpdfCopyright);
++    if (!printVersion) {
++      printUsage("pdftotiff", "<PDF-file> <TIFF-root>", argDesc);
++    }
++    goto err0;
++  }
++  fileName = argv[1];
++  tifRoot = argv[2];
++  
++  // specific to pdftotiff.cc
++  if (!strcmp(tifRoot, "-")) {
++    fprintf(stderr, "Bad output filename: \'-\' (cannot write TIFF file to a pipe)\n");
++    goto err0;
++  }
++  if (mono && tifAlpha) {
++    fprintf(stderr, "Option -alpha cannot be used with option -mono\n");
++    goto err0;
++  }
++
++  // read config file
++  globalParams = new GlobalParams(cfgFileName);
++  globalParams->setupBaseFonts(NULL);
++  if (enableFreeTypeStr[0]) {
++    if (!globalParams->setEnableFreeType(enableFreeTypeStr)) {
++      fprintf(stderr, "Bad '-freetype' value on command line\n");
++    }
++  }
++  if (antialiasStr[0]) {
++    if (!globalParams->setAntialias(antialiasStr)) {
++      fprintf(stderr, "Bad '-aa' value on command line\n");
++    }
++  }
++  if (vectorAntialiasStr[0]) {
++    if (!globalParams->setVectorAntialias(vectorAntialiasStr)) {
++      fprintf(stderr, "Bad '-aaVector' value on command line\n");
++    }
++  }
++  if (quiet) {
++    globalParams->setErrQuiet(quiet);
++  }
++
++  // open PDF file
++  if (ownerPassword[0]) {
++    ownerPW = new GString(ownerPassword);
++  } else {
++    ownerPW = NULL;
++  }
++  if (userPassword[0]) {
++    userPW = new GString(userPassword);
++  } else {
++    userPW = NULL;
++  }
++  doc = new PDFDoc(fileName, ownerPW, userPW);
++  if (userPW) {
++    delete userPW;
++  }
++  if (ownerPW) {
++    delete ownerPW;
++  }
++  if (!doc->isOk()) {
++    exitCode = 1;
++    goto err1;
++  }
++
++  // get page range
++  if (firstPage < 1)
++    firstPage = 1;
++  if (lastPage < 1 || lastPage > doc->getNumPages())
++    lastPage = doc->getNumPages();
++
++  // file name extension
++  ext = "tif";
++
++  // write TIFF files
++  if (mono) {
++    paperColor[0] = 0xff;
++    splashOut = new SplashOutputDev(splashModeMono1, 1, gFalse, paperColor);
++  } else if (gray) {
++    paperColor[0] = 0xff;
++    splashOut = new SplashOutputDev(splashModeMono8, 1, gFalse, paperColor);
++#if SPLASH_CMYK
++  } else if (cmyk) {
++    paperColor[0] = paperColor[1] = paperColor[2] = paperColor[3] = 0;
++    splashOut = new SplashOutputDev(splashModeCMYK8, 1, gFalse, paperColor);
++#endif // SPLASH_CMYK
++  } else {
++    paperColor[0] = paperColor[1] = paperColor[2] = 0xff;
++    splashOut = new SplashOutputDev(splashModeRGB8, 1, gFalse, paperColor);
++  }
++  if (tifAlpha) {
++    splashOut->setNoComposite(gTrue);
++  }
++  splashOut->startDoc(doc->getXRef());
++  for (pg = firstPage; pg <= lastPage; ++pg) {
++    doc->displayPage(splashOut, pg, resolution, resolution, 0,
++		     gFalse, gTrue, gFalse);
++    tifFile = GString::format("{0:s}-{1:06d}.{2:s}", tifRoot, pg, ext);
++    if (!(image = TIFFOpen(tifFile->getCString(), "w"))) {
++      exit(2);
++    }
++    TIFFSetField(image, TIFFTAG_IMAGEWIDTH, splashOut->getBitmap()->getWidth());
++    TIFFSetField(image, TIFFTAG_IMAGELENGTH, splashOut->getBitmap()->getHeight());
++    TIFFSetField(image, TIFFTAG_BITSPERSAMPLE, mono ? 1 : 8);
++    TIFFSetField(image, TIFFTAG_SAMPLESPERPIXEL, mono || gray ? 1 + tifAlpha :
++#if SPLASH_CMYK
++						cmyk ? 4 + tifAlpha : 3 + tifAlpha);
++#else
++						3 + tifAlpha);
++#endif // SPLASH_CMYK
++    TIFFSetField(image, TIFFTAG_PHOTOMETRIC, mono || gray ? PHOTOMETRIC_MINISBLACK :
++#if SPLASH_CMYK
++						cmyk ? PHOTOMETRIC_SEPARATED : PHOTOMETRIC_RGB);
++#else
++						PHOTOMETRIC_RGB);
++#endif // SPLASH_CMYK
++    TIFFSetField(image, TIFFTAG_ROWSPERSTRIP, tifAlpha ? 1 : splashOut->getBitmap()->getHeight());
++    TIFFSetField(image, TIFFTAG_COMPRESSION, nocompress ? COMPRESSION_NONE : mono ? COMPRESSION_CCITTRLE : COMPRESSION_LZW);
++    TIFFSetField(image, TIFFTAG_FILLORDER, FILLORDER_MSB2LSB);
++    TIFFSetField(image, TIFFTAG_PLANARCONFIG, PLANARCONFIG_CONTIG);
++    TIFFSetField(image, TIFFTAG_XRESOLUTION, resolution);
++    TIFFSetField(image, TIFFTAG_YRESOLUTION, resolution);
++    TIFFSetField(image, TIFFTAG_RESOLUTIONUNIT, RESUNIT_INCH);
++    if (tifAlpha) {
++      Guchar *p, *alpha, *row, *rowp;
++      Gushort alphaOut[] = { EXTRASAMPLE_ASSOCALPHA };
++      int y, x;
++      row = (Guchar *)gmallocn(splashOut->getBitmap()->getWidth(), gray ? 2 :
++#if SPLASH_CMYK
++									cmyk ? 5 : 4);
++#else
++									4);
++#endif // SPLASH_CMYK
++      TIFFSetField(image, TIFFTAG_EXTRASAMPLES, 1, alphaOut);
++      p = splashOut->getBitmap()->getDataPtr();
++      alpha = splashOut->getBitmap()->getAlphaPtr();
++      for (y = 0; y < splashOut->getBitmap()->getHeight(); ++y) {
++        rowp = row;
++        for (x = 0; x < splashOut->getBitmap()->getWidth(); ++x) {
++          if (gray) {
++            *rowp++ = *p++;
++#if SPLASH_CMYK
++          } else if (cmyk) {
++            *rowp++ = *p++;
++            *rowp++ = *p++;
++            *rowp++ = *p++;
++            *rowp++ = *p++;
++#endif // SPLASH_CMYK
++          } else {
++            *rowp++ = *p++;
++            *rowp++ = *p++;
++            *rowp++ = *p++;
++	  }
++          *rowp++ = *alpha++;
++        }
++        // write a single line with alpha data
++        TIFFWriteEncodedStrip(image, y, row, splashOut->getBitmap()->getRowSize() + splashOut->getBitmap()->getWidth());
++      }
++      gfree(row);
++    } else {
++      // no alpha channel, write image in one go
++      TIFFWriteEncodedStrip(image, 0, splashOut->getBitmap()->getDataPtr(), splashOut->getBitmap()->getRowSize() * splashOut->getBitmap()->getHeight());
++    }
++    TIFFClose(image);
++    delete tifFile;
++  }
++  delete splashOut;
++
++  exitCode = 0;
++
++  // clean up
++ err1:
++  delete doc;
++  delete globalParams;
++ err0:
++
++  // check for memory leaks
++  Object::memCheck(stderr);
++  gMemReport(stderr);
++
++  return exitCode;
++}
